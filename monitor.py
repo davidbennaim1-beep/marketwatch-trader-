@@ -25,9 +25,9 @@ import yfinance as yf
 
 POSITIONS_FILE  = os.path.join(os.path.dirname(__file__), "positions.json")
 MW_GAME         = "yuse-spring-2026-stock-market-competition-"
-CHECK_INTERVAL  = 120          # seconds between price checks
-TARGET_PCT      =  15.0        # take profit
-STOP_PCT        =  -6.0        # cut loss
+CHECK_INTERVAL  = 30           # seconds between price checks
+TARGET_PCT      =   5.0        # take profit
+STOP_PCT        =  -3.0        # cut loss
 FADE_MIN_PCT    = 100.0        # short stocks up this much % on the day
 FADE_ORDER_USD  = 200_000      # position size for fade trades
 FADE_TIME       = (15, 45)     # run fade scanner at 3:45 PM
