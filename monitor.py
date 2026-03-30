@@ -104,15 +104,23 @@ def place_order(ticker: str, side: str, shares: int):
         time.sleep(0.25)
     time.sleep(2)
 
-    # Click Trade button
+    # Click Trade button next to result
     safari_js('document.querySelector("button.j-trade").click();')
-    time.sleep(2)
+    time.sleep(2.5)
 
-    # Select order type
-    order_id = {"BUY": "order-buy", "SHORT": "order-short",
-                "SELL": "order-sell", "COVER": "order-cover"}[side]
-    safari_js(f'document.querySelector("#{order_id}").click();')
-    time.sleep(0.4)
+    # Click the correct action button by label text
+    action_label = {"BUY": "Buy", "SHORT": "Sell Short",
+                    "SELL": "Sell", "COVER": "Buy to Cover"}[side]
+    safari_js(f"""
+        var btns = document.querySelectorAll('label, button');
+        for (var b of btns) {{
+            if (b.textContent.trim() === '{action_label}') {{
+                b.click();
+                break;
+            }}
+        }}
+    """)
+    time.sleep(0.6)
 
     # Enter shares
     safari_js(f"""
@@ -123,10 +131,20 @@ def place_order(ticker: str, side: str, shares: int):
     """)
     time.sleep(0.4)
 
-    # Market order & submit
+    # Market order
     safari_js('document.querySelector("#priceType").value = "None"; document.querySelector("#priceType").dispatchEvent(new Event("change", {bubbles:true}));')
     time.sleep(0.3)
-    safari_js('document.querySelector("button.j-submit").click();')
+
+    # Submit Order
+    safari_js("""
+        var btns = document.querySelectorAll('button');
+        for (var b of btns) {
+            if (b.textContent.trim() === 'Submit Order') {
+                b.click();
+                break;
+            }
+        }
+    """)
     time.sleep(2)
 
 

@@ -28,11 +28,11 @@ import yfinance as yf
 MW_GAME        = "yuse-spring-2026-stock-market-competition-"
 TARGET_PCT     =  5.0    # take profit
 STOP_PCT       = -3.0    # stop loss
-CHECK_INTERVAL =  30     # seconds between price checks
+CHECK_INTERVAL =  10     # seconds between price checks
 MIN_GAP_PCT    =  3.0    # minimum move % to enter a trade
 MIN_RELVOL     =  1.5    # minimum relative volume
 MIN_PRICE      =  2.0    # minimum stock price
-ORDER_USD      = 200_000 # position size
+ORDER_USD      = 400_000 # position size
 FADE_MIN_PCT   = 100.0   # short stocks up this % near close
 FADE_TIME      = (15, 45)
 CLOSE_TIME     = (15, 55)
@@ -91,12 +91,20 @@ def get_universe() -> list[str]:
 
 def place_order(ticker: str, side: str, shares: int):
     """side: BUY | SHORT | SELL | COVER"""
+    # Button labels as they appear in MarketWatch UI
+    action_label = {
+        "BUY":   "Buy",
+        "SHORT": "Sell Short",
+        "SELL":  "Sell",
+        "COVER": "Buy to Cover",
+    }[side]
+
     run_applescript('tell application "Safari" to activate')
     open_url(f"https://www.marketwatch.com/games/{MW_GAME}/trade")
 
+    # ── Type ticker to trigger autocomplete ───────────────────────────────────
     safari_js('document.querySelector("input.j-miniTrade").focus(); document.querySelector("input.j-miniTrade").click();')
     time.sleep(0.4)
-
     for char in ticker:
         safari_js(f"""
             var inp = document.querySelector('input.j-miniTrade');
@@ -108,14 +116,23 @@ def place_order(ticker: str, side: str, shares: int):
         time.sleep(0.25)
     time.sleep(2)
 
+    # ── Click Trade button next to result ─────────────────────────────────────
     safari_js('document.querySelector("button.j-trade").click();')
-    time.sleep(2)
+    time.sleep(2.5)
 
-    order_id = {"BUY": "order-buy", "SHORT": "order-short",
-                "SELL": "order-sell", "COVER": "order-cover"}[side]
-    safari_js(f'document.querySelector("#{order_id}").click();')
-    time.sleep(0.4)
+    # ── Click the correct action button by label text ─────────────────────────
+    safari_js(f"""
+        var btns = document.querySelectorAll('label, button');
+        for (var b of btns) {{
+            if (b.textContent.trim() === '{action_label}') {{
+                b.click();
+                break;
+            }}
+        }}
+    """)
+    time.sleep(0.6)
 
+    # ── Enter shares ──────────────────────────────────────────────────────────
     safari_js(f"""
         var inp = document.querySelector('input[name="shares"]');
         inp.focus(); inp.value = '{shares}';
@@ -124,9 +141,20 @@ def place_order(ticker: str, side: str, shares: int):
     """)
     time.sleep(0.4)
 
+    # ── Market order ──────────────────────────────────────────────────────────
     safari_js('document.querySelector("#priceType").value = "None"; document.querySelector("#priceType").dispatchEvent(new Event("change", {bubbles:true}));')
     time.sleep(0.3)
-    safari_js('document.querySelector("button.j-submit").click();')
+
+    # ── Submit ────────────────────────────────────────────────────────────────
+    safari_js("""
+        var btns = document.querySelectorAll('button');
+        for (var b of btns) {
+            if (b.textContent.trim() === 'Submit Order') {
+                b.click();
+                break;
+            }
+        }
+    """)
     time.sleep(2)
 
 

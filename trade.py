@@ -163,14 +163,22 @@ def place_trade(trade: dict):
         time.sleep(0.25)
     time.sleep(2)
 
-    # ── Click the Trade button next to the ticker result ─────────────────────
+    # ── Click Trade button next to result ────────────────────────────────────
     safari_js('document.querySelector("button.j-trade").click();')
-    time.sleep(2)
+    time.sleep(2.5)
 
-    # ── Select Buy or Short ───────────────────────────────────────────────────
-    order_id = "order-buy" if side == "BUY" else "order-short"
-    safari_js(f'document.querySelector("#{order_id}").click();')
-    time.sleep(0.4)
+    # ── Click the correct action button by label text ─────────────────────────
+    action_label = {"BUY": "Buy", "SHORT": "Sell Short"}[side]
+    safari_js(f"""
+        var btns = document.querySelectorAll('label, button');
+        for (var b of btns) {{
+            if (b.textContent.trim() === '{action_label}') {{
+                b.click();
+                break;
+            }}
+        }}
+    """)
+    time.sleep(0.6)
 
     # ── Enter number of shares ────────────────────────────────────────────────
     safari_js(f"""
@@ -182,12 +190,20 @@ def place_trade(trade: dict):
     """)
     time.sleep(0.4)
 
-    # ── Select Market order ───────────────────────────────────────────────────
+    # ── Market order ──────────────────────────────────────────────────────────
     safari_js('document.querySelector("#priceType").value = "None"; document.querySelector("#priceType").dispatchEvent(new Event("change", {bubbles:true}));')
-    time.sleep(0.4)
+    time.sleep(0.3)
 
-    # ── Submit order ──────────────────────────────────────────────────────────
-    safari_js('document.querySelector("button.j-submit").click();')
+    # ── Submit Order ──────────────────────────────────────────────────────────
+    safari_js("""
+        var btns = document.querySelectorAll('button');
+        for (var b of btns) {
+            if (b.textContent.trim() === 'Submit Order') {
+                b.click();
+                break;
+            }
+        }
+    """)
     time.sleep(2)
 
     print(f"  Done: {side} {shares:,} x {ticker}")
