@@ -25,6 +25,7 @@ from datetime import datetime, date
 from collections import defaultdict
 
 import yfinance as yf
+import pandas as pd
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -122,10 +123,107 @@ def passes_filters(q: dict) -> bool:
     )
 
 
+# ── Technical analysis (runs on shortlisted candidates only) ──────────────────
+
+def analyze_technicals(ticker: str) -> dict:
+    """
+    Fetch 1-min intraday candles and return a dict of technical factors.
+    Returns a neutral dict (no boost, no block) if data unavailable.
+    """
+    neutral = {
+        "vwap": None, "above_vwap": None,
+        "trend": "FLAT",
+        "vol_accel": 1.0,
+        "pct_off_high": 5.0, "pct_off_low": 5.0,
+        "candle_quality": 0.5,
+        "tech_score": 1.0,
+    }
+    try:
+        df = yf.download(ticker, period="1d", interval="1m",
+                         progress=False, auto_adjust=True)
+        if df.empty or len(df) < 6:
+            return neutral
+
+        # Flatten MultiIndex columns if present
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        # ── VWAP ──────────────────────────────────────────────────────────────
+        df["typical"] = (df["High"] + df["Low"] + df["Close"]) / 3
+        total_vol = df["Volume"].sum()
+        vwap = float((df["typical"] * df["Volume"]).sum() / total_vol) if total_vol > 0 else None
+        last_price = float(df["Close"].iloc[-1])
+        above_vwap = (last_price > vwap) if vwap else None
+
+        # ── Trend: last 5 candles ─────────────────────────────────────────────
+        closes = df["Close"].tail(5).values.flatten()
+        ups   = sum(1 for i in range(1, len(closes)) if closes[i] > closes[i-1])
+        downs = sum(1 for i in range(1, len(closes)) if closes[i] < closes[i-1])
+        trend = "UP" if ups >= 3 else ("DOWN" if downs >= 3 else "FLAT")
+
+        # ── Volume acceleration: last 5 min vs prior 10 min ──────────────────
+        recent_vol = float(df["Volume"].tail(5).mean())
+        prior_vol  = float(df["Volume"].tail(15).head(10).mean())
+        vol_accel  = (recent_vol / prior_vol) if prior_vol > 0 else 1.0
+
+        # ── Distance from day high / low ──────────────────────────────────────
+        day_high = float(df["High"].max())
+        day_low  = float(df["Low"].min())
+        pct_off_high = (day_high - last_price) / day_high * 100 if day_high > 0 else 0
+        pct_off_low  = (last_price - day_low)  / day_low  * 100 if day_low  > 0 else 0
+
+        # ── Candle quality: avg body/range of last 5 candles ─────────────────
+        # High ratio = clean directional moves; low = choppy wicks
+        ratios = []
+        for _, row in df.tail(5).iterrows():
+            rng  = float(row["High"]) - float(row["Low"])
+            body = abs(float(row["Close"]) - float(row["Open"]))
+            if rng > 0:
+                ratios.append(body / rng)
+        candle_quality = sum(ratios) / len(ratios) if ratios else 0.5
+
+        # ── Composite technical score (multiplier applied to base signal) ─────
+        # Each factor adds or subtracts from a 1.0 base
+        tech = 1.0
+        if above_vwap is True:   tech += 0.30   # above VWAP = bullish
+        if above_vwap is False:  tech -= 0.10   # slight penalty below VWAP
+        if trend == "UP":        tech += 0.25   # recent candles trending up
+        if trend == "DOWN":      tech -= 0.20   # trending against us
+        if vol_accel > 1.5:      tech += 0.20   # volume accelerating
+        if vol_accel < 0.7:      tech -= 0.15   # volume dying out
+        if pct_off_high < 2.0:   tech += 0.15   # near day high (longs: strong)
+        if pct_off_high > 8.0:   tech -= 0.15   # far from high (fading)
+        if candle_quality > 0.6: tech += 0.10   # clean candles
+        if candle_quality < 0.3: tech -= 0.10   # choppy wicks
+
+        return {
+            "vwap":          vwap,
+            "above_vwap":    above_vwap,
+            "trend":         trend,
+            "vol_accel":     vol_accel,
+            "pct_off_high":  pct_off_high,
+            "pct_off_low":   pct_off_low,
+            "candle_quality": candle_quality,
+            "tech_score":    max(tech, 0.1),   # never go below 0.1×
+        }
+    except Exception:
+        return neutral
+
+
+def tech_summary(t: dict) -> str:
+    """One-line string showing key technical factors."""
+    vwap_str = "↑VWAP" if t["above_vwap"] else ("↓VWAP" if t["above_vwap"] is False else "VWAP?")
+    return (f"{vwap_str}  trend={t['trend']}  "
+            f"vaccel={t['vol_accel']:.1f}x  "
+            f"offHigh={t['pct_off_high']:.1f}%  "
+            f"cq={t['candle_quality']:.2f}  "
+            f"→ techx{t['tech_score']:.2f}")
+
+
 # ── Signal scoring ─────────────────────────────────────────────────────────────
 
 def score_long(q: dict, intraday_highs: dict) -> tuple[float, str]:
-    """Returns (score, signal_name). Score 0 = no signal."""
+    """Returns (base_score, signal_name). Score 0 = no signal."""
     ticker = q["ticker"]
     change = q["change"]
     rv     = q["rel_vol"]
@@ -271,13 +369,14 @@ def close_pos(pos: Position, price: float, shares: int, reason: str) -> float:
 
 def scan(positions: list[Position], intraday_highs: dict) -> list[dict]:
     held    = {p.ticker for p in positions if not p.closed}
-    recent  = {p.ticker for p in positions[-6:]}   # avoid re-entering recent trades
+    recent  = {p.ticker for p in positions[-6:]}
     exclude = held | recent
 
-    universe        = get_universe()
+    universe         = get_universe()
     long_candidates  = []
     short_candidates = []
 
+    # ── Pass 1: quick filter (price, volume, gap %) ───────────────────────────
     for ticker in universe:
         if ticker in exclude:
             continue
@@ -296,11 +395,63 @@ def scan(positions: list[Position], intraday_highs: dict) -> list[dict]:
     long_candidates.sort(reverse=True)
     short_candidates.sort(reverse=True)
 
+    # ── Pass 2: deep technical analysis on top 5 per side ────────────────────
+    # This is slower (fetches 1-min candles) but only runs on best candidates.
     results = []
-    for score, signal, q in long_candidates[:1]:
-        results.append({"side": "BUY",   "score": score, "signal": signal, "q": q})
-    for score, signal, q in short_candidates[:1]:
-        results.append({"side": "SHORT", "score": score, "signal": signal, "q": q})
+
+    for base_score, signal, q in long_candidates[:5]:
+        ticker = q["ticker"]
+        print(f"    Analyzing {ticker} [{signal}] base_score={base_score:.1f} …")
+        t = analyze_technicals(ticker)
+        print(f"      {tech_summary(t)}")
+
+        # Block longs that are trending down or far below VWAP
+        if t["trend"] == "DOWN" and t["above_vwap"] is False:
+            print(f"      ✗ {ticker} skipped — trending DOWN below VWAP")
+            continue
+
+        final_score = base_score * t["tech_score"]
+        results.append({
+            "side":   "BUY",
+            "score":  final_score,
+            "signal": signal,
+            "q":      q,
+            "tech":   t,
+        })
+
+    for base_score, signal, q in short_candidates[:5]:
+        ticker = q["ticker"]
+        print(f"    Analyzing {ticker} [{signal}] base_score={base_score:.1f} …")
+        t = analyze_technicals(ticker)
+        # For shorts, invert the VWAP/trend logic
+        short_tech = t.copy()
+        tech = 1.0
+        if t["above_vwap"] is False: tech += 0.30   # below VWAP = bearish (good for short)
+        if t["above_vwap"] is True:  tech -= 0.10
+        if t["trend"] == "DOWN":     tech += 0.25
+        if t["trend"] == "UP":       tech -= 0.20
+        if t["vol_accel"] > 1.5:     tech += 0.20
+        if t["vol_accel"] < 0.7:     tech -= 0.15
+        if t["pct_off_low"] < 2.0:   tech += 0.15   # near day low = strong short
+        if t["pct_off_low"] > 8.0:   tech -= 0.15
+        if t["candle_quality"] > 0.6: tech += 0.10
+        if t["candle_quality"] < 0.3: tech -= 0.10
+        short_tech["tech_score"] = max(tech, 0.1)
+        print(f"      {tech_summary(short_tech)}")
+
+        # Block shorts that are trending up and above VWAP
+        if t["trend"] == "UP" and t["above_vwap"] is True:
+            print(f"      ✗ {ticker} skipped — trending UP above VWAP")
+            continue
+
+        final_score = base_score * short_tech["tech_score"]
+        results.append({
+            "side":   "SHORT",
+            "score":  final_score,
+            "signal": signal,
+            "q":      q,
+            "tech":   short_tech,
+        })
 
     results.sort(key=lambda x: x["score"], reverse=True)
     return results
@@ -446,9 +597,12 @@ def main():
                 shares = int(min(shares, TOTAL_CAPITAL * 0.95) / q["price"])
                 if shares <= 0:
                     continue
+                t = c.get("tech", {})
                 print(f"\n  NEW  {side:5}  {q['ticker']}  [{signal}]  "
                       f"{q['change']:+.1f}%  rv={q['rel_vol']:.1f}x  score={score:.0f}  "
                       f"→  {shares:,} @ ${q['price']:.2f}")
+                if t:
+                    print(f"       {tech_summary(t)}")
                 place_order(q["ticker"], side, shares)
                 pos = Position(q["ticker"], side, shares, q["price"], signal)
                 positions.append(pos)
