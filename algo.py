@@ -50,6 +50,21 @@ TRAIL_PCT        = 2.0        # trailing stop — locks in gains (trails 2% belo
 TIME_STOP_MINUTES  = 25       # minutes before time stop kicks in
 TIME_STOP_MIN_MOVE = 1.5      # must be at least this % in profit to avoid time stop
 
+# Breakeven stop — once up this %, move stop to 0% (never let a winner turn into a loser)
+BREAKEVEN_TRIGGER  = 2.0
+
+# Risk management
+DAILY_LOSS_LIMIT   = -15_000  # stop all trading if P&L drops below this
+MAX_FLOAT_SHARES   = 100_000_000   # only trade low-float stocks (< 100M shares)
+
+# Entry time window — momentum trades work best in first 2 hours
+ENTRY_CLOSE_HOUR   = 11       # stop looking for new entries after this hour
+ENTRY_CLOSE_MIN    = 30       # and this minute  (11:30 AM)
+
+# SPY filter — don't fight the market
+SPY_MIN_CHANGE_LONG  =  -1.0  # don't go long if SPY is down more than 1%
+SPY_MAX_CHANGE_SHORT =   1.0  # don't go short if SPY is up more than 1%
+
 # Fade (pre-close)
 FADE_MIN_PCT     = 100.0
 FADE_TIME        = (15, 45)
@@ -119,6 +134,28 @@ def get_universe() -> list[str]:
     import backtest as b
     live = b.fetch_live_movers(b.BT)
     return list(dict.fromkeys(b.BT["gap_universe"] + live))
+
+
+def get_spy_change() -> float | None:
+    """Return SPY's % change from previous close. None if unavailable."""
+    try:
+        fi   = yf.Ticker("SPY").fast_info
+        prev = getattr(fi, "previous_close", None)
+        last = getattr(fi, "last_price",     None)
+        if prev and last and prev > 0:
+            return (last - prev) / prev * 100
+    except Exception:
+        pass
+    return None
+
+
+def get_float(ticker: str) -> float | None:
+    """Return float shares. Slower call — only use on shortlisted candidates."""
+    try:
+        info = yf.Ticker(ticker).info
+        return info.get("floatShares") or info.get("sharesOutstanding")
+    except Exception:
+        return None
 
 
 def passes_filters(q: dict) -> bool:
@@ -360,9 +397,10 @@ class Position:
         self.signal       = signal
         self.peak_pnl     = 0.0
         self.scaled_out   = False
+        self.breakeven_set = False
         self.closed       = False
         self.pnl_usd      = 0.0
-        self.entry_time   = datetime.now()   # for time stop
+        self.entry_time   = datetime.now()
 
     def pnl_pct(self, price: float) -> float:
         if self.side == "BUY":
@@ -416,15 +454,37 @@ def scan(positions: list[Position], intraday_highs: dict) -> list[dict]:
     # This is slower (fetches 1-min candles) but only runs on best candidates.
     results = []
 
+    # ── SPY market filter ─────────────────────────────────────────────────────
+    spy_chg = get_spy_change()
+    spy_str = f"SPY {spy_chg:+.2f}%" if spy_chg is not None else "SPY N/A"
+    print(f"    Market: {spy_str}")
+
     for base_score, signal, q in long_candidates[:5]:
         ticker = q["ticker"]
+
+        # Don't go long if market is tanking
+        if spy_chg is not None and spy_chg < SPY_MIN_CHANGE_LONG:
+            print(f"    ✗ {ticker} skipped — SPY too weak for longs ({spy_chg:+.2f}%)")
+            continue
+
         print(f"    Analyzing {ticker} [{signal}] base_score={base_score:.1f} …")
+
+        # Float filter — skip large-cap stocks that won't move enough
+        float_shares = get_float(ticker)
+        if float_shares and float_shares > MAX_FLOAT_SHARES:
+            print(f"      ✗ {ticker} skipped — float too large ({float_shares/1e6:.0f}M shares)")
+            continue
+
         t = analyze_technicals(ticker)
         print(f"      {tech_summary(t)}")
 
-        # Block longs that are trending down or far below VWAP
-        if t["trend"] == "DOWN" and t["above_vwap"] is False:
-            print(f"      ✗ {ticker} skipped — trending DOWN below VWAP")
+        # Hard gate: must be above VWAP AND not trending down
+        if t["above_vwap"] is False and t["trend"] == "DOWN":
+            print(f"      ✗ {ticker} skipped — below VWAP + trending DOWN")
+            continue
+        # Hard gate: must not be volume dying AND trending down
+        if t["vol_accel"] < 0.6 and t["trend"] == "DOWN":
+            print(f"      ✗ {ticker} skipped — volume dying + trending DOWN")
             continue
 
         final_score = base_score * t["tech_score"]
@@ -434,31 +494,43 @@ def scan(positions: list[Position], intraday_highs: dict) -> list[dict]:
             "signal": signal,
             "q":      q,
             "tech":   t,
+            "float":  float_shares,
         })
 
     for base_score, signal, q in short_candidates[:5]:
         ticker = q["ticker"]
+
+        # Don't go short if market is ripping
+        if spy_chg is not None and spy_chg > SPY_MAX_CHANGE_SHORT:
+            print(f"    ✗ {ticker} skipped — SPY too strong for shorts ({spy_chg:+.2f}%)")
+            continue
+
         print(f"    Analyzing {ticker} [{signal}] base_score={base_score:.1f} …")
+
+        float_shares = get_float(ticker)
+        if float_shares and float_shares > MAX_FLOAT_SHARES:
+            print(f"      ✗ {ticker} skipped — float too large ({float_shares/1e6:.0f}M shares)")
+            continue
+
         t = analyze_technicals(ticker)
-        # For shorts, invert the VWAP/trend logic
         short_tech = t.copy()
         tech = 1.0
-        if t["above_vwap"] is False: tech += 0.30   # below VWAP = bearish (good for short)
+        if t["above_vwap"] is False: tech += 0.30
         if t["above_vwap"] is True:  tech -= 0.10
         if t["trend"] == "DOWN":     tech += 0.25
         if t["trend"] == "UP":       tech -= 0.20
         if t["vol_accel"] > 1.5:     tech += 0.20
         if t["vol_accel"] < 0.7:     tech -= 0.15
-        if t["pct_off_low"] < 2.0:   tech += 0.15   # near day low = strong short
+        if t["pct_off_low"] < 2.0:   tech += 0.15
         if t["pct_off_low"] > 8.0:   tech -= 0.15
         if t["candle_quality"] > 0.6: tech += 0.10
         if t["candle_quality"] < 0.3: tech -= 0.10
         short_tech["tech_score"] = max(tech, 0.1)
         print(f"      {tech_summary(short_tech)}")
 
-        # Block shorts that are trending up and above VWAP
-        if t["trend"] == "UP" and t["above_vwap"] is True:
-            print(f"      ✗ {ticker} skipped — trending UP above VWAP")
+        # Hard gate: must be below VWAP AND not trending up
+        if t["above_vwap"] is True and t["trend"] == "UP":
+            print(f"      ✗ {ticker} skipped — above VWAP + trending UP")
             continue
 
         final_score = base_score * short_tech["tech_score"]
@@ -468,6 +540,7 @@ def scan(positions: list[Position], intraday_highs: dict) -> list[dict]:
             "signal": signal,
             "q":      q,
             "tech":   short_tech,
+            "float":  float_shares,
         })
 
     results.sort(key=lambda x: x["score"], reverse=True)
@@ -566,9 +639,11 @@ def main():
                   f"{pnl_pct:+.1f}%  ${pnl_usd:+,.0f}  "
                   f"[{pos.signal}]  peak={pos.peak_pnl:+.1f}%")
 
-            # Hard stop
-            if pnl_pct <= STOP_PCT:
-                pnl = close_pos(pos, price, pos.shares, f"STOP {pnl_pct:.1f}%")
+            # Hard stop (or breakeven stop once triggered)
+            effective_stop = max(STOP_PCT, 0.0) if pos.breakeven_set else STOP_PCT
+            if pnl_pct <= effective_stop:
+                label = "BEVEN STOP" if pos.breakeven_set else f"STOP {pnl_pct:.1f}%"
+                pnl = close_pos(pos, price, pos.shares, label)
                 total_pnl += pnl
                 pos.closed = True
                 trade_count += 1
@@ -593,6 +668,12 @@ def main():
                 trade_count += 1
                 continue
 
+            # Move stop to breakeven once up BREAKEVEN_TRIGGER %
+            if not pos.breakeven_set and pnl_pct >= BREAKEVEN_TRIGGER:
+                pos.breakeven_set = True
+                print(f"  [{now.strftime('%H:%M:%S')}]  BREAKEVEN SET  {pos.ticker}  "
+                      f"stop moved to 0%  (currently {pnl_pct:+.1f}%)")
+
             # Scale out at +3% (sell half)
             if not pos.scaled_out and pnl_pct >= SCALE_OUT_PCT:
                 half = pos.shares // 2
@@ -609,11 +690,20 @@ def main():
                 pos.closed = True
                 trade_count += 1
 
+        # ── Daily loss limit ───────────────────────────────────────────────────
+        if total_pnl <= DAILY_LOSS_LIMIT:
+            print(f"\n  DAILY LOSS LIMIT HIT: ${total_pnl:,.0f}  — no more trades today.")
+            time.sleep(CHECK_INTERVAL)
+            continue
+
         # ── Find new trades if slots available ─────────────────────────────────
         open_positions = [p for p in positions if not p.closed]
         slots = MAX_POSITIONS - len(open_positions)
 
-        if slots > 0 and (hour, mins) < FADE_TIME:
+        # Only enter new trades in the morning session (best momentum window)
+        past_entry_window = (hour, mins) >= (ENTRY_CLOSE_HOUR, ENTRY_CLOSE_MIN)
+
+        if slots > 0 and (hour, mins) < FADE_TIME and not past_entry_window:
             candidates = scan(positions, intraday_highs)
             for c in candidates[:slots]:
                 q      = c["q"]
@@ -624,9 +714,11 @@ def main():
                 shares = int(min(shares, TOTAL_CAPITAL * 0.95) / q["price"])
                 if shares <= 0:
                     continue
-                t = c.get("tech", {})
+                t     = c.get("tech", {})
+                flt   = c.get("float")
+                flt_s = f"  float={flt/1e6:.0f}M" if flt else ""
                 print(f"\n  NEW  {side:5}  {q['ticker']}  [{signal}]  "
-                      f"{q['change']:+.1f}%  rv={q['rel_vol']:.1f}x  score={score:.0f}  "
+                      f"{q['change']:+.1f}%  rv={q['rel_vol']:.1f}x  score={score:.0f}{flt_s}  "
                       f"→  {shares:,} @ ${q['price']:.2f}")
                 if t:
                     print(f"       {tech_summary(t)}")
