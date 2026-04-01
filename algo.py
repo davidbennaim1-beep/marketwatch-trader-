@@ -61,12 +61,9 @@ MAX_FLOAT_SHARES   = 100_000_000   # only trade low-float stocks (< 100M shares)
 ENTRY_CLOSE_HOUR   = 11       # stop looking for new entries after this hour
 ENTRY_CLOSE_MIN    = 30       # and this minute  (11:30 AM)
 
-# SPY filter — don't fight the market
-SPY_MIN_CHANGE_LONG  =  -1.0  # don't go long if SPY is down more than 1%
-SPY_MAX_CHANGE_SHORT =   1.0  # don't go short if SPY is up more than 1%
 
 # Fade (pre-close)
-FADE_MIN_PCT     = 100.0
+FADE_MIN_PCT     = 30.0   # short any stock up 30%+ near close (was 100%)
 FADE_TIME        = (15, 45)
 CLOSE_TIME       = (15, 55)
 
@@ -135,18 +132,6 @@ def get_universe() -> list[str]:
     live = b.fetch_live_movers(b.BT)
     return list(dict.fromkeys(b.BT["gap_universe"] + live))
 
-
-def get_spy_change() -> float | None:
-    """Return SPY's % change from previous close. None if unavailable."""
-    try:
-        fi   = yf.Ticker("SPY").fast_info
-        prev = getattr(fi, "previous_close", None)
-        last = getattr(fi, "last_price",     None)
-        if prev and last and prev > 0:
-            return (last - prev) / prev * 100
-    except Exception:
-        pass
-    return None
 
 
 def get_float(ticker: str) -> float | None:
@@ -454,19 +439,8 @@ def scan(positions: list[Position], intraday_highs: dict) -> list[dict]:
     # This is slower (fetches 1-min candles) but only runs on best candidates.
     results = []
 
-    # ── SPY market filter ─────────────────────────────────────────────────────
-    spy_chg = get_spy_change()
-    spy_str = f"SPY {spy_chg:+.2f}%" if spy_chg is not None else "SPY N/A"
-    print(f"    Market: {spy_str}")
-
     for base_score, signal, q in long_candidates[:5]:
         ticker = q["ticker"]
-
-        # Don't go long if market is tanking
-        if spy_chg is not None and spy_chg < SPY_MIN_CHANGE_LONG:
-            print(f"    ✗ {ticker} skipped — SPY too weak for longs ({spy_chg:+.2f}%)")
-            continue
-
         print(f"    Analyzing {ticker} [{signal}] base_score={base_score:.1f} …")
 
         # Float filter — skip large-cap stocks that won't move enough
@@ -499,11 +473,6 @@ def scan(positions: list[Position], intraday_highs: dict) -> list[dict]:
 
     for base_score, signal, q in short_candidates[:5]:
         ticker = q["ticker"]
-
-        # Don't go short if market is ripping
-        if spy_chg is not None and spy_chg > SPY_MAX_CHANGE_SHORT:
-            print(f"    ✗ {ticker} skipped — SPY too strong for shorts ({spy_chg:+.2f}%)")
-            continue
 
         print(f"    Analyzing {ticker} [{signal}] base_score={base_score:.1f} …")
 
@@ -547,10 +516,11 @@ def scan(positions: list[Position], intraday_highs: dict) -> list[dict]:
     return results
 
 
-def scan_fade(positions: list[Position]) -> dict | None:
-    held    = {p.ticker for p in positions if not p.closed}
-    universe = get_universe()
-    best = None
+def scan_fade(positions: list[Position]) -> list[dict]:
+    """Return ranked list of fade candidates (biggest gainers to short near close)."""
+    held      = {p.ticker for p in positions if not p.closed}
+    universe  = get_universe()
+    candidates = []
     for ticker in universe:
         if ticker in held:
             continue
@@ -558,9 +528,10 @@ def scan_fade(positions: list[Position]) -> dict | None:
         if not q or q["price"] < MIN_PRICE:
             continue
         if q["change"] >= FADE_MIN_PCT:
-            if best is None or q["change"] > best["change"]:
-                best = q
-    return best
+            candidates.append(q)
+    # Sort by biggest gainer first — they have the most to give back
+    candidates.sort(key=lambda x: x["change"], reverse=True)
+    return candidates
 
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
@@ -604,13 +575,17 @@ def main():
             print(f"\n  3:55 PM — all closed.  P&L: ${total_pnl:+,.0f}  |  Trades: {trade_count}\n")
             break
 
-        # ── Fade scan at 3:45 ──────────────────────────────────────────────────
+        # ── Fade scan at 3:45 — short the biggest gainers ─────────────────────
         if (hour, mins) >= FADE_TIME and not fade_done:
             fade_done = True
-            if len(open_positions) < MAX_POSITIONS:
-                print(f"\n  [{now.strftime('%H:%M')}] Fade scan …")
-                fq = scan_fade(positions)
-                if fq:
+            slots_available = MAX_POSITIONS - len(open_positions)
+            if slots_available > 0:
+                print(f"\n  [{now.strftime('%H:%M')}] Fade scan — shorting biggest gainers …")
+                fade_list = scan_fade(positions)
+                if fade_list:
+                    summary = ", ".join(q["ticker"] + f' +{q["change"]:.0f}%' for q in fade_list[:5])
+                    print(f"  Found {len(fade_list)} fade candidate(s): {summary}")
+                for fq in fade_list[:slots_available]:
                     shares = int(TOTAL_CAPITAL / MAX_POSITIONS / fq["price"])
                     print(f"  FADE SHORT  {fq['ticker']}  up {fq['change']:+.1f}%  →  {shares:,} @ ${fq['price']:.2f}")
                     place_order(fq["ticker"], "SHORT", shares)
@@ -618,6 +593,8 @@ def main():
                     positions.append(pos)
                     open_positions.append(pos)
                     trade_count += 1
+                if not fade_list:
+                    print(f"  No stocks up {FADE_MIN_PCT:.0f}%+ found for fade.")
 
         # ── Monitor open positions ─────────────────────────────────────────────
         for pos in open_positions:
