@@ -35,16 +35,20 @@ TOTAL_CAPITAL    = 400_000    # total capital to deploy
 CHECK_INTERVAL   = 10         # seconds between scans
 
 # Entry filters
-MIN_PRICE        = 5.0        # minimum stock price
-MIN_DOLLAR_VOL   = 5_000_000  # minimum $ traded today
-MIN_RELVOL       = 1.5        # minimum relative volume
-MIN_CHANGE_PCT   = 3.0        # minimum % move to consider
+MIN_PRICE        = 3.0        # minimum stock price
+MIN_DOLLAR_VOL   = 2_000_000  # minimum $ traded today
+MIN_RELVOL       = 3.0        # minimum relative volume (only truly exceptional volume)
+MIN_CHANGE_PCT   = 8.0        # minimum % move to consider (raised — weak moves waste capital)
 
 # Exit thresholds
 SCALE_OUT_PCT    = 3.0        # sell 50% of position here
 FULL_TARGET_PCT  = 7.0        # sell remaining 50% here
 STOP_PCT         = -3.0       # hard stop loss
 TRAIL_PCT        = 2.0        # trailing stop — locks in gains (trails 2% below peak)
+
+# Time stop — exit flat positions instead of holding all day
+TIME_STOP_MINUTES  = 25       # minutes before time stop kicks in
+TIME_STOP_MIN_MOVE = 1.5      # must be at least this % in profit to avoid time stop
 
 # Fade (pre-close)
 FADE_MIN_PCT     = 100.0
@@ -88,6 +92,7 @@ def get_quote(ticker: str) -> dict | None:
         avg_vol     = getattr(fi, "three_month_average_volume", None)
         day_high    = getattr(fi, "day_high",                   None)
         day_low     = getattr(fi, "day_low",                    None)
+        open_price  = getattr(fi, "open",                       None)
         if not prev or not price or prev <= 0:
             return None
         change      = (price - prev) / prev * 100
@@ -97,6 +102,7 @@ def get_quote(ticker: str) -> dict | None:
             "ticker":     ticker,
             "price":      price,
             "prev":       prev,
+            "open":       open_price or price,
             "change":     change,
             "rel_vol":    rel_vol,
             "dollar_vol": dollar_vol,
@@ -227,20 +233,25 @@ def score_long(q: dict, intraday_highs: dict) -> tuple[float, str]:
     ticker = q["ticker"]
     change = q["change"]
     rv     = q["rel_vol"]
+    price  = q["price"]
 
-    # Signal 1: Gap at open (big gap up with volume)
-    if change >= 5.0 and rv >= 2.0:
-        score = change * rv * 1.2   # boost gap signals
+    # Hard reject: price is BELOW the open — gap already filled, momentum gone
+    if price < q["open"] * 0.99:
+        return 0.0, ""
+
+    # Signal 1: Gap at open — big gap up, still holding above open
+    if change >= MIN_CHANGE_PCT and rv >= 3.0 and price >= q["open"] * 0.995:
+        score = change * rv * 1.2
         return score, "GAP"
 
-    # Signal 2: Momentum continuation (already up 10%+ and still at day high)
-    if change >= 10.0 and q["price"] >= q["day_high"] * 0.995:
+    # Signal 2: Momentum continuation — up big, near day high, not fading
+    if change >= 15.0 and price >= q["day_high"] * 0.98:
         score = change * rv
         return score, "MOMENTUM"
 
-    # Signal 3: Intraday breakout (price just broke above previous day high)
+    # Signal 3: Intraday breakout above previous scan's high
     prev_high = intraday_highs.get(ticker, 0)
-    if prev_high > 0 and q["price"] > prev_high * 1.01 and rv >= 1.5:
+    if prev_high > 0 and price > prev_high * 1.01 and rv >= 2.0 and change >= 5.0:
         score = change * rv * 0.9
         return score, "BREAKOUT"
 
@@ -250,13 +261,18 @@ def score_long(q: dict, intraday_highs: dict) -> tuple[float, str]:
 def score_short(q: dict) -> tuple[float, str]:
     change = q["change"]
     rv     = q["rel_vol"]
+    price  = q["price"]
 
-    # Signal 1: Gap down with volume
-    if change <= -5.0 and rv >= 2.0:
+    # Hard reject: price is ABOVE the open — bounce already underway
+    if price > q["open"] * 1.01:
+        return 0.0, ""
+
+    # Signal 1: Gap down, still below open
+    if change <= -MIN_CHANGE_PCT and rv >= 3.0 and price <= q["open"] * 1.005:
         return abs(change) * rv * 1.2, "GAP DOWN"
 
-    # Signal 2: Momentum down — already down 10%+ at day low
-    if change <= -10.0 and q["price"] <= q["day_low"] * 1.005:
+    # Signal 2: Momentum down — down big, near day low
+    if change <= -15.0 and price <= q["day_low"] * 1.02:
         return abs(change) * rv, "MOMENTUM DOWN"
 
     return 0.0, ""
@@ -342,10 +358,11 @@ class Position:
         self.shares       = shares
         self.entry_price  = entry_price
         self.signal       = signal
-        self.peak_pnl     = 0.0       # for trailing stop
-        self.scaled_out   = False     # have we sold 50% yet
+        self.peak_pnl     = 0.0
+        self.scaled_out   = False
         self.closed       = False
         self.pnl_usd      = 0.0
+        self.entry_time   = datetime.now()   # for time stop
 
     def pnl_pct(self, price: float) -> float:
         if self.side == "BUY":
@@ -552,6 +569,16 @@ def main():
             # Hard stop
             if pnl_pct <= STOP_PCT:
                 pnl = close_pos(pos, price, pos.shares, f"STOP {pnl_pct:.1f}%")
+                total_pnl += pnl
+                pos.closed = True
+                trade_count += 1
+                continue
+
+            # Time stop — if stock hasn't moved after TIME_STOP_MINUTES, cut it
+            minutes_held = (now - pos.entry_time).seconds / 60
+            if minutes_held >= TIME_STOP_MINUTES and pnl_pct < TIME_STOP_MIN_MOVE:
+                pnl = close_pos(pos, price, pos.shares,
+                                f"TIME STOP {minutes_held:.0f}min flat {pnl_pct:+.1f}%")
                 total_pnl += pnl
                 pos.closed = True
                 trade_count += 1
